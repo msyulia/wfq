@@ -1,7 +1,7 @@
 use crate::{Node, OpDesc};
 use std::iter::repeat_with;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 pub struct WFQueueHandle<'a, T> {
     _queue: &'a WFQueue<T>,
@@ -11,8 +11,7 @@ pub struct WFQueueHandle<'a, T> {
 impl<'a, T> WFQueueHandle<'a, T> {
     pub fn enqueue(&self, _value: T) {
         match self._queue.get_state_at(self._handle_id) {
-            Some(node) => {
-                node;
+            Some(_node) => {
                 todo!()
             }
             None => todo!(),
@@ -46,7 +45,8 @@ impl<T> WFQueue<T> {
     }
 
     pub(crate) fn get_state_at(&self, index: usize) -> Option<Arc<OpDesc<T>>> {
-        self._state.get(index).map(|arc| arc.clone())
+        let state = self._state.get(index).cloned();
+        state
     }
 
     pub fn get_handle(&self) -> WFQueueHandle<T> {
@@ -56,4 +56,14 @@ impl<T> WFQueue<T> {
             _handle_id: tid,
         }
     }
+}
+
+#[cfg(test)]
+mod tests {
+    // use super::WFQueue;
+    // #[test]
+    // fn test_new_queue() {
+    //     let _ = WFQueue::<()>::new(1);
+    //     assert!(true)
+    // }
 }

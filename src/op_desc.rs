@@ -1,5 +1,6 @@
 use crate::Node;
 
+#[allow(dead_code)]
 pub struct OpDesc<T> {
     phase: i64,
     pending: bool,
