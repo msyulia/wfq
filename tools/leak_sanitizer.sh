@@ -1,0 +1,1 @@
+RUSTFLAGS="-Z sanitizer=leak" cargo test --target x86_64-apple-darwin 
