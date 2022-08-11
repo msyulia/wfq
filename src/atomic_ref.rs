@@ -20,14 +20,8 @@ impl<T> Inner<T> {
         }
     }
 
-    pub(crate) fn to_ptr(self) -> *mut Self {
+    pub(crate) fn into_ptr(self) -> *mut Self {
         Box::into_raw(Box::new(self))
-    }
-}
-
-impl<T> Drop for Inner<T> {
-    fn drop(&mut self) {
-        println!("Dropping inner");
     }
 }
 
@@ -41,7 +35,7 @@ impl<T> AtomicRef<T> {
     pub fn new(value: T) -> Self {
         let inner = Inner::new(value);
         Self {
-            inner: AtomicPtr::new(inner.to_ptr()),
+            inner: AtomicPtr::new(inner.into_ptr()),
             _marker: PhantomData,
         }
     }
@@ -91,11 +85,13 @@ impl<T> AtomicRef<T> {
                 // New is now being referenced in at least two places `self` and `new`
                 // need to increase reference count
                 unsafe { self.inc_rc(Ordering::Release) };
-                // No need to decrease the old pointers reference count because we yes it is being reference in one place less
-                // but we return it in the result therefore the operations cancel out
                 Ok(AtomicRef::from_raw(ptr))
             }
-            Err(ptr) => Err(AtomicRef::from_raw(ptr)),
+            Err(ptr) => {
+                // We are giving out another reference to `self` therefore we increase the reference count
+                unsafe { self.inc_rc(Ordering::Release) };
+                Err(AtomicRef::from_raw(ptr))
+            }
         }
     }
 }
@@ -186,9 +182,11 @@ mod tests {
     fn test_cas_failure() {
         let ar1 = AtomicRef::new(5);
         let ar2 = AtomicRef::new(7);
+        let ar3 = AtomicRef::new(7);
         let unchanged_value = ar1
-            .compare_and_exchange(ar1.clone(), ar2, Ordering::Release, Ordering::Relaxed)
+            .compare_and_exchange(ar3, ar2, Ordering::Release, Ordering::Relaxed)
             .expect_err("CAS Succeded instead of fail");
+        assert_eq!(unsafe { ar1.rc() }, 2);
         assert_eq!(*unchanged_value, 5);
         assert_eq!(*ar1, 5);
     }
