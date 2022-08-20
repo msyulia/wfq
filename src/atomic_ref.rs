@@ -1,9 +1,7 @@
 use std::{
     marker::PhantomData,
     ops::Deref,
-    ptr,
-    sync::atomic::{fence, AtomicPtr, AtomicUsize, Ordering},
-    sync::Arc,
+    sync::atomic::{AtomicPtr, AtomicUsize, Ordering},
 };
 
 #[derive(Debug)]
@@ -40,32 +38,22 @@ impl<T> AtomicRef<T> {
         }
     }
 
-    pub(crate) fn from_raw(ptr: *mut Inner<T>) -> Self {
-        AtomicRef {
-            inner: AtomicPtr::new(ptr),
-            _marker: PhantomData,
-        }
+    pub fn rc(&self) -> usize {
+        unsafe { self.as_ref(Ordering::Relaxed) }
+            .rc
+            .load(Ordering::Relaxed)
     }
 
-    pub(crate) fn to_raw(&self) -> *mut Inner<T> {
-        self.inner.load(Ordering::Relaxed)
+    pub fn store(&self, value: T) -> AtomicRef<T> {
+        let new = Inner::new(value);
+        let old = self.clone();
+        let _ = self.dec_rc(Ordering::Release); // decreasing rc because of the following store
+        self.inner.store(new.into_ptr(), Ordering::Release);
+        old
     }
 
-    pub(crate) unsafe fn rc(&self) -> usize {
-        unsafe { self.as_ref() }.rc.load(Ordering::Relaxed)
-    }
-
-    pub(crate) unsafe fn dec_rc(&self, ordering: Ordering) -> usize {
-        unsafe { self.as_ref() }.rc.fetch_sub(1, ordering)
-    }
-
-    pub(crate) unsafe fn inc_rc(&self, ordering: Ordering) -> usize {
-        unsafe { self.as_ref() }.rc.fetch_add(1, ordering)
-    }
-
-    pub(crate) unsafe fn as_ref(&self) -> &Inner<T> {
-        let ptr = self.inner.load(Ordering::Relaxed);
-        &*ptr
+    pub fn load(&self, ordering: Ordering) -> &T {
+        &unsafe { self.as_ref(ordering) }.value
     }
 
     pub fn compare_and_exchange(
@@ -84,15 +72,46 @@ impl<T> AtomicRef<T> {
             Ok(ptr) => {
                 // New is now being referenced in at least two places `self` and `new`
                 // need to increase reference count
-                unsafe { self.inc_rc(Ordering::Release) };
+                self.inc_rc(Ordering::AcqRel);
                 Ok(AtomicRef::from_raw(ptr))
             }
             Err(ptr) => {
                 // We are giving out another reference to `self` therefore we increase the reference count
-                unsafe { self.inc_rc(Ordering::Release) };
+                self.inc_rc(Ordering::AcqRel);
                 Err(AtomicRef::from_raw(ptr))
             }
         }
+    }
+
+    pub(crate) unsafe fn as_ref(&self, ordering: Ordering) -> &Inner<T> {
+        let ptr = self.inner.load(ordering);
+        &*ptr
+    }
+
+    fn dec_rc(&self, ordering: Ordering) -> usize {
+        unsafe { self.as_ref(Ordering::Relaxed) }
+            .rc
+            .fetch_sub(1, ordering)
+    }
+
+    fn inc_rc(&self, ordering: Ordering) -> usize {
+        unsafe { self.as_ref(Ordering::Relaxed) }
+            .rc
+            .fetch_add(1, ordering)
+    }
+
+    fn from_raw(ptr: *mut Inner<T>) -> Self {
+        AtomicRef {
+            inner: AtomicPtr::new(ptr),
+            _marker: PhantomData,
+        }
+    }
+}
+
+impl<T> PartialEq for AtomicRef<T> {
+    /// Compares whether the things that both `self` and `other` point to are the same, i.e. whether pointers are equal
+    fn eq(&self, other: &Self) -> bool {
+        self.inner.load(Ordering::Relaxed) == other.inner.load(Ordering::Relaxed)
     }
 }
 
@@ -100,7 +119,7 @@ impl<T> Deref for AtomicRef<T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
-        let temp = unsafe { self.as_ref() };
+        let temp = unsafe { self.as_ref(Ordering::Relaxed) };
         &temp.value
     }
 }
@@ -109,7 +128,9 @@ impl<T> Clone for AtomicRef<T> {
     fn clone(&self) -> Self {
         let ptr = self.inner.load(Ordering::Acquire);
 
-        let old_rc = unsafe { self.as_ref() }.rc.fetch_add(1, Ordering::AcqRel);
+        let old_rc = unsafe { self.as_ref(Ordering::Relaxed) }
+            .rc
+            .fetch_add(1, Ordering::AcqRel);
 
         if old_rc >= isize::MAX as usize {
             std::process::abort();
@@ -124,7 +145,9 @@ impl<T> Clone for AtomicRef<T> {
 
 impl<T> Drop for AtomicRef<T> {
     fn drop(&mut self) {
-        let old_rc = unsafe { self.as_ref() }.rc.fetch_sub(1, Ordering::AcqRel);
+        let old_rc = unsafe { self.as_ref(Ordering::Relaxed) }
+            .rc
+            .fetch_sub(1, Ordering::AcqRel);
         if old_rc != 1 {
             return;
         }
@@ -162,18 +185,25 @@ mod tests {
     }
 
     #[test]
+    fn test_store() {
+        let ar = AtomicRef::new(5);
+        ar.store(10);
+        assert_eq!(*ar, 10);
+    }
+
+    #[test]
     fn test_cas_success() {
         let ar = AtomicRef::new(5);
-        assert_eq!(unsafe { ar.rc() }, 1);
+        assert_eq!(ar.rc(), 1);
         let new_value = AtomicRef::new(10);
-        assert_eq!(unsafe { new_value.rc() }, 1);
+        assert_eq!(new_value.rc(), 1);
         let ar_clone = ar.clone();
-        assert_eq!(unsafe { ar_clone.rc() }, 2);
+        assert_eq!(ar_clone.rc(), 2);
         let value = ar
             .compare_and_exchange(ar_clone, new_value, Ordering::Release, Ordering::Relaxed)
             .unwrap();
-        assert_eq!(unsafe { value.rc() }, 1);
-        assert_eq!(unsafe { ar.rc() }, 1);
+        assert_eq!(value.rc(), 1);
+        assert_eq!(ar.rc(), 1);
         assert_eq!(*value, 5);
         assert_eq!(*ar, 10);
     }
@@ -186,7 +216,7 @@ mod tests {
         let unchanged_value = ar1
             .compare_and_exchange(ar3, ar2, Ordering::Release, Ordering::Relaxed)
             .expect_err("CAS Succeded instead of fail");
-        assert_eq!(unsafe { ar1.rc() }, 2);
+        assert_eq!(ar1.rc(), 2);
         assert_eq!(*unchanged_value, 5);
         assert_eq!(*ar1, 5);
     }

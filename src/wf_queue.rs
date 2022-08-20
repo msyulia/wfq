@@ -1,61 +1,99 @@
-use crate::{Node, OpDesc};
+use crate::handle::WFQueueHandle;
+use crate::{AtomicRef, NodeRef, OpDesc, OpDescRef, Phase};
+use core::panic;
 use std::iter::repeat_with;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-pub struct WFQueueHandle<'a, T> {
-    _queue: &'a WFQueue<T>,
-    _handle_id: usize,
-}
-
-impl<'a, T> WFQueueHandle<'a, T> {
-    pub fn enqueue(&self, _value: T) {
-        match self._queue.get_state_at(self._handle_id) {
-            Some(_node) => {
-                todo!()
-            }
-            None => todo!(),
-        }
-    }
-
-    pub fn dequeue(&self) -> Option<T> {
-        None
-    }
-}
-
 pub struct WFQueue<T> {
-    _head: Option<Arc<Node<T>>>,
-    _tail: Option<Arc<Node<T>>>,
-    _state: Box<[Arc<OpDesc<T>>]>,
-    _max_threads: usize,
-    _last_given_out_tid: AtomicUsize,
+    head: NodeRef<T>,
+    tail: NodeRef<T>,
+    state: Box<[OpDescRef<T>]>,
+    max_threads: usize,
+    last_tid: AtomicUsize,
 }
 
 impl<T> WFQueue<T> {
     pub fn new(state_length: usize) -> Self {
+        if state_length == 0 {
+            panic!("State can't be zero sized")
+        }
         let mut initial_state = Vec::with_capacity(state_length);
-        initial_state.extend(repeat_with(|| Arc::new(OpDesc::default())).take(state_length));
+        initial_state.extend(repeat_with(|| AtomicRef::new(OpDesc::default())).take(state_length));
         WFQueue {
-            _head: None,
-            _tail: None,
-            _state: initial_state.into_boxed_slice(),
-            _max_threads: state_length,
-            _last_given_out_tid: AtomicUsize::new(0),
+            head: AtomicRef::new(None),
+            tail: AtomicRef::new(None),
+            state: initial_state.into_boxed_slice(),
+            max_threads: state_length,
+            last_tid: AtomicUsize::new(0),
         }
     }
 
-    pub(crate) fn get_state_at(&self, index: usize) -> Option<Arc<OpDesc<T>>> {
-        let state = self._state.get(index).cloned();
+    pub fn max_phase(&self) -> Phase {
+        max_phase(&self.state)
+    }
+
+    pub(crate) fn get_state_at_unchecked(&self, index: usize) -> OpDescRef<T> {
+        // Safety: Can't construct `Self` with state being zero length without panicking
+        // We never give out a handle that has an index bigger than the max allowed index
+        let state = unsafe { self.state.get_unchecked(index) };
+        state.clone()
+    }
+
+    pub(crate) fn set_state_at_unchecked(&self, index: usize, new: OpDesc<T>) {
+        // Safety: Can't construct `Self` with state being zero length without panicking
+        // We never give out a handle that has an index bigger than the max allowed index
+        unsafe { self.state.get_unchecked(index) }.store(new);
+    }
+
+    pub(crate) fn get_state_at(&self, index: usize) -> Option<OpDescRef<T>> {
+        let state = self.state.get(index).cloned();
         state
     }
 
-    pub fn get_handle(&self) -> WFQueueHandle<T> {
-        let tid = self._last_given_out_tid.fetch_add(1, Ordering::SeqCst);
-        WFQueueHandle {
-            _queue: self,
-            _handle_id: tid,
+    pub(crate) fn help(&self, phase: Phase) {
+        for op in self.state.iter() {
+            if op.is_enqueue() {
+                self.help_enq(phase)
+            } else {
+                self.help_deq(phase)
+            }
         }
     }
+
+    pub(crate) fn help_finish_enqueue(&self) {
+        let tail = &*self.tail;
+        let next = tail;
+        if let Some(node) = next {
+            let thread_id = node.enqueue_thread();
+            let current_op = self.get_state_at_unchecked(thread_id);
+        }
+    }
+
+    fn help_deq(&self, phase: Phase) {
+        todo!()
+    }
+
+    fn help_enq(&self, phase: Phase) {
+        todo!()
+    }
+
+    pub fn get_handle(&self) -> Option<WFQueueHandle<T>> {
+        let last_tid = self.last_tid.load(Ordering::Acquire);
+        if last_tid + 1 < self.max_threads {
+            let tid = self.last_tid.fetch_add(1, Ordering::Relaxed);
+            Some(WFQueueHandle::new(self, tid))
+        } else {
+            None
+        }
+    }
+}
+
+fn max_phase<T>(state: &[OpDescRef<T>]) -> Phase {
+    let mut max = 0;
+    for s in state {
+        max = if max < s.phase() { s.phase() } else { max };
+    }
+    max
 }
 
 #[cfg(test)]
