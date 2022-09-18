@@ -8,6 +8,6 @@ pub use node::*;
 pub use op_desc::*;
 pub use wf_queue::*;
 
-type NodeRef<T> = AtomicRef<Option<Node<T>>>;
+type NodeRef<T> = AtomicRef<Node<T>>;
 type OpDescRef<T> = AtomicRef<OpDesc<T>>;
 type Phase = i64;

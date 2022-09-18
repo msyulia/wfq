@@ -1,8 +1,14 @@
 use std::{
     marker::PhantomData,
     ops::Deref,
+    ptr,
     sync::atomic::{AtomicPtr, AtomicUsize, Ordering},
 };
+
+pub trait Nullable {
+    fn null() -> Self;
+    fn is_null(&self) -> bool;
+}
 
 #[derive(Debug)]
 pub(crate) struct Inner<T> {
@@ -11,7 +17,7 @@ pub(crate) struct Inner<T> {
 }
 
 impl<T> Inner<T> {
-    pub(crate) fn new(value: T) -> Self {
+    pub(crate) const fn new(value: T) -> Self {
         Self {
             value,
             rc: AtomicUsize::new(1),
@@ -44,7 +50,7 @@ impl<T> AtomicRef<T> {
             .load(Ordering::Relaxed)
     }
 
-    pub fn store(&self, value: T) -> AtomicRef<T> {
+    pub fn swap(&self, value: T) -> AtomicRef<T> {
         let new = Inner::new(value);
         let old = self.clone();
         let _ = self.dec_rc(Ordering::Release); // decreasing rc because of the following store
@@ -108,12 +114,43 @@ impl<T> AtomicRef<T> {
     }
 }
 
+impl<T> Eq for AtomicRef<T> {}
+
 impl<T> PartialEq for AtomicRef<T> {
     /// Compares whether the things that both `self` and `other` point to are the same, i.e. whether pointers are equal
     fn eq(&self, other: &Self) -> bool {
         self.inner.load(Ordering::Relaxed) == other.inner.load(Ordering::Relaxed)
     }
 }
+
+impl<T> Nullable for AtomicRef<T> {
+    fn null() -> Self {
+        Self {
+            inner: AtomicPtr::new(ptr::null_mut()),
+            _marker: PhantomData,
+        }
+    }
+
+    fn is_null(&self) -> bool {
+        self.inner.load(Ordering::Relaxed).is_null()
+    }
+}
+
+impl<T> Default for AtomicRef<T>
+where
+    T: Default,
+{
+    fn default() -> Self {
+        let inner = Inner::new(T::default());
+        Self {
+            inner: AtomicPtr::new(inner.into_ptr()),
+            _marker: PhantomData,
+        }
+    }
+}
+
+unsafe impl<T: Sync + Send> Send for AtomicRef<T> {}
+unsafe impl<T: Sync + Send> Sync for AtomicRef<T> {}
 
 impl<T> Deref for AtomicRef<T> {
     type Target = T;
@@ -126,40 +163,43 @@ impl<T> Deref for AtomicRef<T> {
 
 impl<T> Clone for AtomicRef<T> {
     fn clone(&self) -> Self {
-        let ptr = self.inner.load(Ordering::Acquire);
+        if self.is_null() {
+            Self::null()
+        } else {
+            let ptr = self.inner.load(Ordering::Acquire);
 
-        let old_rc = unsafe { self.as_ref(Ordering::Relaxed) }
-            .rc
-            .fetch_add(1, Ordering::AcqRel);
+            let old_rc = unsafe { self.as_ref(Ordering::Relaxed) }
+                .rc
+                .fetch_add(1, Ordering::AcqRel);
 
-        if old_rc >= isize::MAX as usize {
-            std::process::abort();
-        }
+            if old_rc >= isize::MAX as usize {
+                std::process::abort();
+            }
 
-        Self {
-            inner: AtomicPtr::new(ptr),
-            _marker: PhantomData,
+            Self {
+                inner: AtomicPtr::new(ptr),
+                _marker: PhantomData,
+            }
         }
     }
 }
 
 impl<T> Drop for AtomicRef<T> {
     fn drop(&mut self) {
-        let old_rc = unsafe { self.as_ref(Ordering::Relaxed) }
-            .rc
-            .fetch_sub(1, Ordering::AcqRel);
-        if old_rc != 1 {
-            return;
-        }
+        if !self.is_null() {
+            let old_rc = unsafe { self.as_ref(Ordering::Relaxed) }
+                .rc
+                .fetch_sub(1, Ordering::AcqRel);
+            if old_rc != 1 {
+                return;
+            }
 
-        // fence(Ordering::Acquire);
-        let ptr = self.inner.load(Ordering::Acquire);
-        let _ = unsafe { Box::from_raw(ptr) };
+            // fence(Ordering::Acquire);
+            let ptr = self.inner.load(Ordering::Acquire);
+            let _ = unsafe { Box::from_raw(ptr) };
+        }
     }
 }
-
-unsafe impl<T: Sync + Send> Send for AtomicRef<T> {}
-unsafe impl<T: Sync + Send> Sync for AtomicRef<T> {}
 
 #[cfg(test)]
 mod tests {
@@ -187,7 +227,7 @@ mod tests {
     #[test]
     fn test_store() {
         let ar = AtomicRef::new(5);
-        ar.store(10);
+        ar.swap(10);
         assert_eq!(*ar, 10);
     }
 
